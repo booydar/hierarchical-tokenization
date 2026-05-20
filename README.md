@@ -73,3 +73,139 @@ accelerate launch --config_file accelerate.yaml \
 
 The scripts log metrics and save checkpoints to the directory specified via `--exp_path`.
 
+## Hierarchical tokenization (learned segmentation + RMT)
+
+This repo implements **content-adaptive chunking** for Recurrent Memory Transformer (RMT) on the KV-retrieval task. Instead of splitting the context into fixed-size windows, a chunker learns where segment boundaries fall; RMT then runs one recurrent step per segment.
+
+There are **two entry points** (different chunker designs):
+
+| Script | Chunker | Model class | Typical use |
+|--------|---------|-------------|-------------|
+| `run_dynamic_rmt_on_kv_retrieval.py` | H-Net-style `RoutingModule` (cosine similarity + argmax boundaries) | `RMTForReasoningDynamicChunking` | STE + ratio loss; flat sequences via `collate_fn_dynamic` |
+| `run_h_tok_on_kv_retrieval.py` | `DynamicChunker` (soft Gaussian assignment, conv/linear encoder) | `RMTForAdaptiveReasoning` | Stage-1 HD-RMT per `CLAUDE.md`; fixed `K` chunks |
+
+Both reuse the same KV datasets under `./data/` and the tokenizer at `./tokenizers/kv_alphabet_62/`. See `CLAUDE.md` for design goals and ablations.
+
+### Quick start: H-Net dynamic chunking (`run_dynamic_rmt_on_kv_retrieval.py`)
+
+Single-GPU example (4 KV pairs, target ~4 tokens per segment):
+
+```bash
+conda activate <your-env>   # see Prerequisites
+cd /path/to/hierarchical-tokenization
+
+accelerate launch --config_file accelerate.yaml \
+  run_dynamic_rmt_on_kv_retrieval.py \
+  --exp_path ./runs/dyn_chunk_N4_kv \
+  --per_device_batch_size 64 \
+  --data_path ./data/P4-K4V4-S4(32-64)_1M \
+  --tokenizer_path ./tokenizers/kv_alphabet_62/ \
+  --base_model gpt2 \
+  --n_layer 4 --n_head 4 --n_embd 128 \
+  --n_pairs 4 --n_keys 2 --n_values 2 \
+  --n_mem_tokens 4 \
+  --max_n_segments 96 \
+  --chunker_compression_ratio 4.0 \
+  --chunker_aux_loss_weight 0.01 \
+  --chunker_lr_multiplier 2.0 \
+  --learning_rate 1e-4 \
+  --max_steps 50000 \
+  --eval_steps 200 \
+  --logging_steps 50
+```
+
+Multi-GPU (e.g. 6 GPUs, effective batch = `per_device_batch_size × num_gpus`):
+
+```bash
+accelerate launch \
+  --config_file accelerate.yaml \
+  --num_processes 6 \
+  run_dynamic_rmt_on_kv_retrieval.py \
+  --exp_path ./runs/dyn_chunk_N8_kv \
+  --per_device_batch_size 16 \
+  --data_path ./data/N8-K4V4-S4(32-64)_1M \
+  --n_pairs 8 --n_mem_tokens 8 \
+  --chunker_compression_ratio 8.0 \
+  ...
+```
+
+If `./data/...` is missing, the script **generates** a dataset on first run using `kv_dataset_utils.generate_sequence` (controlled by `--n_pairs`, `--n_keys`, `--n_values`).
+
+**Chunker-specific flags**
+
+| Flag | Meaning |
+|------|---------|
+| `chunker_compression_ratio` | Target average segment length `N` (tokens). Ratio loss pulls boundary rate toward `1/N`. Example: `4.0` ≈ one boundary every 4 tokens. |
+| `chunker_aux_loss_weight` | λ in `loss = lm_loss + λ * ratio_loss` (default `0.01`). Set `0` to disable ratio loss (not recommended). |
+| `chunker_lr_multiplier` | AdamW LR for `routing_module` = `learning_rate × multiplier` (default `2.0`). |
+
+**Training diagnostics**
+
+- TensorBoard: `tensorboard --logdir runs/<exp_name>`
+- Logged scalars: `lm_loss`, `ratio_loss`, `mean_p_boundary`, `empirical_boundary_rate`
+- On the first real training step, a log line confirms routing-module gradients (`Sanity check: routing module gradient OK`)
+
+**Resume from checkpoint**
+
+```bash
+  --model_cpt ./runs/dyn_chunk_N4_kv
+```
+
+The script picks the latest `checkpoint-*` and loads `model.safetensors`.
+
+### Quick start: soft DynamicChunker (`run_h_tok_on_kv_retrieval.py`)
+
+Fixed vs adaptive ablation scripts live under `scripts/h-tok/`:
+
+```bash
+# Adaptive (learned boundaries, fixed K chunks)
+bash scripts/h-tok/run_adaptive_rmt_on_kv_retrieval.sh
+
+# Fixed-stride baseline (same data, pairs_per_segment sweep)
+bash scripts/h-tok/run_fixed_rmt_on_kv_retrieval.sh
+
+# Multi-GPU
+NP=4 bash scripts/h-tok/run_adaptive_rmt_on_kv_retrieval.sh
+```
+
+Manual launch:
+
+```bash
+accelerate launch --config_file accelerate.yaml \
+  run_h_tok_on_kv_retrieval.py \
+  --exp_path ./runs-htok/my_adaptive_run \
+  --per_device_batch_size 64 \
+  --data_path ./data/N16-K2V2-V62_1M \
+  --use_adaptive_chunking true \
+  --n_chunks 8 \
+  --chunker_sigma 1.0 \
+  --chunker_encoder_type conv \
+  --n_mem_tokens 8 \
+  ...
+```
+
+Key flags: `n_chunks` (fixed number of pooled chunks), `chunker_sigma` (assignment sharpness), `chunker_encoder_type` (`conv` or `linear`), `hard_inference` (hard boundaries at eval).
+
+### Inspect learned segment boundaries
+
+After training dynamic-RMT checkpoints under `runs/dyn_chunk_*`:
+
+```bash
+PYTHONPATH=. python scripts/visualize_learned_segments.py \
+  --runs_root runs \
+  --n_examples 2 \
+  --pair_counts 2 4 8
+```
+
+This loads each run’s latest checkpoint, runs the routing module on validation samples, and prints per-segment token spans and boundary probabilities (in-distribution vs other pair counts).
+
+### Comparison to fixed-segment RMT
+
+| | Fixed RMT | Dynamic RMT (`run_dynamic_rmt`) |
+|--|-----------|----------------------------------|
+| Entry script | `run_original_rmt_on_kv_retrieval-v3-gen.py` | `run_dynamic_rmt_on_kv_retrieval.py` |
+| Dataloader | Pre-segmented dicts per window | Flat `input_ids` + `labels=-100` on context |
+| Boundaries | `pairs_per_segment` / chunk size | Learned `RoutingModule` + ratio loss |
+
+For fair comparison, set `chunker_compression_ratio` to roughly the same token budget you would use for a fixed chunk size on the same task (e.g. ratio `8` when the fixed baseline uses ~8 tokens per segment).
+

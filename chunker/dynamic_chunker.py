@@ -1,137 +1,192 @@
-"""
-DynamicChunker: content-adaptive soft chunker for HD-RMT Stage 1.
-
-Takes token embeddings x: [B, L, D] and produces:
-  chunks:          [B, K, D]  — K pooled chunk representations
-  boundary_scores: [B, L]     — per-position boundary probability
-
-K (n_chunks) is fixed at construction time. Boundary *positions* are learned
-end-to-end from task loss via the soft assignment matrix W. No boundary
-supervision — gradients flow entirely through the downstream task.
-"""
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+import torch.nn.functional as F
 
 
-class DynamicChunker(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_chunks: int,
-        d_hidden: Optional[int] = None,
-        sigma: float = 1.0,
-        encoder_type: str = "conv",
-    ):
-        """
-        Args:
-            d_model:      input embedding dimension D
-            n_chunks:     number of output chunks K (fixed)
-            d_hidden:     boundary encoder hidden dim; defaults to D // 4
-            sigma:        soft assignment temperature; smaller = sharper boundaries
-            encoder_type: "conv" (depthwise-separable, preferred) or "linear" (ablation)
-        """
+@dataclass
+class RoutingModuleOutput:
+    boundary_prob: torch.Tensor
+    boundary_mask: torch.Tensor
+    selected_probs: torch.Tensor
+
+
+@dataclass
+class RoutingModuleState:
+    """
+    The state of the routing module.
+
+    Contains
+        - [has_seen_tokens] (batch_size,) bool tensor. Whether that batch element has processed any tokens yet.
+        - [last_hidden_state] (batch_size, d_model) tensor. The last hidden state of the batch element (used for boundary prediction).
+    """
+
+    has_seen_tokens: torch.Tensor  # (batch_size,)
+    last_hidden_state: torch.Tensor  # (batch_size, d_model)
+
+
+class RoutingModule(nn.Module):
+
+    def __init__(self, d_model, device=None, dtype=None):
+        self.d_model = d_model
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.n_chunks = n_chunks
-        self.sigma = sigma
-        self.eps = 1e-8
+        self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        self.k_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        with torch.no_grad():
+            self.q_proj_layer.weight.copy_(torch.eye(d_model))
+            self.k_proj_layer.weight.copy_(torch.eye(d_model))
+        self.q_proj_layer.weight._no_reinit = True
+        self.k_proj_layer.weight._no_reinit = True
 
-        if d_hidden is None:
-            d_hidden = max(d_model // 4, 1)
-        self.d_hidden = d_hidden
-        self.encoder_type = encoder_type
+    def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
+        return RoutingModuleState(
+            has_seen_tokens=torch.zeros(batch_size, device=device, dtype=torch.bool),
+            last_hidden_state=torch.zeros(
+                batch_size, self.d_model, device=device, dtype=dtype
+            ),
+        )
 
-        if encoder_type == "conv":
-            # Depthwise conv captures local 3-token context cheaply.
-            # groups=d_model gives true depthwise (one filter per channel),
-            # then pointwise 1x1 projects to d_hidden.
-            self.boundary_encoder = nn.Sequential(
-                nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
-                nn.GELU(),
-                nn.Conv1d(d_model, d_hidden, kernel_size=1),
+    def forward(self, hidden_states, cu_seqlens=None, mask=None, inference_params=None):
+        assert (mask is not None) or (
+            cu_seqlens is not None
+        ), "Either mask or cu_seqlens must be provided"
+
+        if inference_params is not None:
+            assert (
+                mask is not None
+            ), "Mask must be provided if inference_params is provided"
+            assert (
+                ~inference_params.has_seen_tokens
+            ).all(), "Cannot have seen tokens when inference_params is not provided"
+
+        if cu_seqlens is not None:
+            # We are in packed mode, so hidden_states is (T, D). Make it (B, T, D)
+            hidden_states = hidden_states.unsqueeze(0)
+
+        cos_sim = torch.einsum(
+            "b l d, b l d -> b l",
+            F.normalize(self.q_proj_layer(hidden_states[:, :-1]), dim=-1),
+            F.normalize(self.k_proj_layer(hidden_states[:, 1:]), dim=-1),
+        )
+        # this clamp should no-op as long as no precision issues are encountered
+        boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
+
+        # Force boundary probability of the first element to 1.0
+        PAD_PROB = 1.0
+        boundary_prob = F.pad(boundary_prob, (1, 0), "constant", PAD_PROB)
+
+        if cu_seqlens is not None:
+            boundary_prob = boundary_prob.squeeze(0)
+            boundary_prob[cu_seqlens[:-1]] = PAD_PROB
+
+        boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
+
+        selected_idx = torch.argmax(boundary_prob, dim=-1)
+
+        boundary_mask = selected_idx == 1  # (shape hidden_states.shape[:-1])
+        if mask is not None:
+            # No invalid tokens can be selected
+            boundary_mask = boundary_mask & mask
+
+        if inference_params is not None:
+            has_mask = mask.any(dim=-1)
+            inference_params.has_seen_tokens.copy_(
+                has_mask | inference_params.has_seen_tokens
             )
-        elif encoder_type == "linear":
-            # Per-token linear: ablation baseline, no local context.
-            self.boundary_encoder = nn.Linear(d_model, d_hidden)
+            last_mask = torch.clamp(mask.sum(dim=-1) - 1, min=0)
+            inference_params.last_hidden_state.copy_(
+                torch.where(
+                    has_mask,
+                    hidden_states[
+                        torch.arange(
+                            hidden_states.shape[0], device=hidden_states.device
+                        ),
+                        last_mask,
+                    ],
+                    inference_params.last_hidden_state,
+                )
+            )
+
+        selected_probs = boundary_prob.gather(
+            dim=-1, index=selected_idx.unsqueeze(-1)
+        )  # (shape hidden_states.shape[:-1], 1)
+
+        return RoutingModuleOutput(
+            boundary_prob=boundary_prob,  # (shape hidden_states.shape[:-1], 2)
+            boundary_mask=boundary_mask,  # (shape hidden_states.shape[:-1])
+            selected_probs=selected_probs,  # (shape hidden_states.shape[:-1], 1)
+        )
+
+    def step(self, hidden_states, inference_params):
+        # hidden_states is (B, 1, D)
+        hidden_states = hidden_states.squeeze(1)
+        cos_sim = torch.einsum(
+            "b d, b d -> b",
+            F.normalize(self.q_proj_layer(inference_params.last_hidden_state), dim=-1),
+            F.normalize(self.k_proj_layer(hidden_states), dim=-1),
+        )
+        boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
+        inference_params.last_hidden_state.copy_(hidden_states)
+        boundary_prob = torch.where(
+            inference_params.has_seen_tokens,
+            boundary_prob,
+            torch.ones_like(boundary_prob),
+        )
+        boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
+
+        inference_params.has_seen_tokens.copy_(
+            torch.ones_like(inference_params.has_seen_tokens)
+        )
+        return RoutingModuleOutput(
+            boundary_prob=boundary_prob,  # (B, 2)
+            boundary_mask=boundary_prob[..., 1] > 0.5,  # (B,)
+            selected_probs=boundary_prob.max(dim=-1).values.unsqueeze(-1),  # (B, 1)
+        )
+
+
+class ChunkLayer(nn.Module):
+
+    def forward(self, hidden_states, boundary_mask, cu_seqlens=None, mask=None):
+        assert (mask is not None) or (
+            cu_seqlens is not None
+        ), "Either mask or cu_seqlens must be provided"
+
+        if cu_seqlens is not None:
+            next_hidden_states = hidden_states[boundary_mask]
+            next_cu_seqlens = F.pad(
+                boundary_mask.cumsum(dim=0)[cu_seqlens[1:] - 1], (1, 0)
+            )
+            next_max_seqlen = int((next_cu_seqlens[1:] - next_cu_seqlens[:-1]).max())
+            next_mask = None
         else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type!r}. Use 'conv' or 'linear'.")
+            next_cu_seqlens = None
+            num_tokens = boundary_mask.sum(dim=-1)
+            next_max_seqlen = int(num_tokens.max())
 
-        self.boundary_proj = nn.Linear(d_hidden, 1)
+            device = hidden_states.device
+            L = hidden_states.shape[1]
+            token_idx = (
+                torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
+            )
+            seq_sorted_indices = torch.argsort(token_idx, dim=1)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        hard: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x:    [B, L, D] token embeddings
-            hard: use argmax hard boundaries (for inference); default False (soft)
+            next_hidden_states = torch.gather(
+                hidden_states,
+                dim=1,
+                index=seq_sorted_indices[:, :next_max_seqlen, None].expand(
+                    -1, -1, hidden_states.shape[-1]
+                ),
+            )
 
-        Returns:
-            chunks:          [B, K, D]
-            boundary_scores: [B, L]   raw sigmoid scores, not supervised
-        """
-        B, L, D = x.shape
-        K = self.n_chunks
+            next_mask = (
+                torch.arange(next_max_seqlen, device=device)[None, :]
+                < num_tokens[:, None]
+            )
+            next_max_seqlen = None
 
-        # 1. boundary scoring
-        if self.encoder_type == "conv":
-            # Conv1d expects [B, C, L]
-            h = self.boundary_encoder(x.transpose(1, 2)).transpose(1, 2)  # [B, L, d_hidden]
-        else:
-            h = self.boundary_encoder(x)  # [B, L, d_hidden]
+        return next_hidden_states, next_cu_seqlens, next_max_seqlen, next_mask
 
-        b = torch.sigmoid(self.boundary_proj(h))  # [B, L, 1]
-
-        if hard:
-            return self._hard_forward(x, b)
-
-        # 2. soft chunk assignment via cumulative boundary mass
-        # Normalize so that sum of b_norm ≈ K, giving each token a position in [0, K].
-        b_norm = b * (K / (b.sum(dim=1, keepdim=True) + self.eps))  # [B, L, 1]
-        cumsum = b_norm.cumsum(dim=1)  # [B, L, 1]  values in ~[0, K]
-
-        # Soft assignment: token i → chunk j weight = Gaussian centered at j+0.5
-        j_centers = torch.arange(K, device=x.device).float() + 0.5  # [K]
-        W = torch.exp(
-            -0.5 * ((cumsum - j_centers.view(1, 1, K)) / self.sigma) ** 2
-        )  # [B, L, K]
-        W = W / (W.sum(dim=1, keepdim=True) + self.eps)  # normalize over tokens → [B, L, K]
-
-        # 3. weighted pool: each chunk = weighted average of token embeddings
-        chunks = torch.einsum("blk,bld->bkd", W, x)  # [B, K, D]
-
-        return chunks, b.squeeze(-1)  # [B, K, D], [B, L]
-
-    def _hard_forward(
-        self,
-        x: torch.Tensor,
-        b: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Hard boundary inference: top-(K-1) boundary positions split x into K
-        non-overlapping segments; each segment is mean-pooled to one vector.
-        Not differentiable — use only at inference.
-        """
-        B, L, D = x.shape
-        K = self.n_chunks
-        boundary_scores = b.squeeze(-1)  # [B, L]
-
-        # Pick K-1 highest-scoring positions as boundaries
-        hard_boundaries = boundary_scores.topk(K - 1, dim=1).indices  # [B, K-1]
-        hard_boundaries, _ = hard_boundaries.sort(dim=1)  # ascending
-
-        chunks_list = []
-        for i in range(B):
-            splits = [0] + hard_boundaries[i].tolist() + [L]
-            segs = []
-            for j in range(K):
-                start, end = splits[j], splits[j + 1]
-                end = max(end, start + 1)  # guarantee non-empty
-                segs.append(x[i, start:end].mean(dim=0))
-            chunks_list.append(torch.stack(segs, dim=0))
-
-        chunks = torch.stack(chunks_list, dim=0)  # [B, K, D]
-        return chunks, boundary_scores
+    def step(self, hidden_states, boundary_mask):
+        return hidden_states[boundary_mask]

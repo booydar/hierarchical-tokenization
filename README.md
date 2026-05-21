@@ -131,6 +131,8 @@ accelerate launch \
 
 If `./data/...` is missing, the script **generates** a dataset on first run using `kv_dataset_utils.generate_sequence` (controlled by `--n_pairs`, `--n_keys`, `--n_values`).
 
+**Query segment.** The model finds the first ``?`` token (`RMTConfig.query_token_id`, set from the KV tokenizer in the training script) and forces the query (`?!key:` …) into one segment; the target (if present) starts the next segment. No manual span metadata in the batch. For inference, call `model.generate` on **`context + query` only** (no target tokens).
+
 **Chunker-specific flags**
 
 | Flag | Meaning |

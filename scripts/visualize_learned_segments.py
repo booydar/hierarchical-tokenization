@@ -72,6 +72,7 @@ def build_model_and_tokenizer(ckpt_dir: Path, run_cfg: Dict[str, Any], device: t
     rmt_config.k2 = run_cfg.get("k2", -1)
     rmt_config.chunker_compression_ratio = run_cfg.get("chunker_compression_ratio")
     rmt_config.chunker_aux_loss_weight = run_cfg.get("chunker_aux_loss_weight", 0.01)
+    rmt_config.query_token_id = tokenizer.convert_tokens_to_ids("?")
 
     model = RMTForReasoningDynamicChunking(rmt_config)
     weights = ckpt_dir / "model.safetensors"
@@ -88,13 +89,14 @@ def build_model_and_tokenizer(ckpt_dir: Path, run_cfg: Dict[str, Any], device: t
     return model, tokenizer
 
 
-def encode_sample(sample: Dict[str, str], tokenizer) -> Tuple[torch.Tensor, torch.Tensor, str]:
-    """Flat sequence: context + query (no target — we only inspect chunking on context+query)."""
+def encode_sample(sample: Dict[str, str], tokenizer):
+    """Full training layout: context + query + target."""
     ctx = sample["context"]
     qry = sample["query"]
-    text = ctx + qry
-    ids = tokenizer.encode(text, add_special_tokens=False)
-    input_ids = torch.tensor([ids], dtype=torch.long)
+    tgt = sample.get("target", "")
+    text = ctx + qry + tgt
+    full_ids = tokenizer.encode(text, add_special_tokens=False)
+    input_ids = torch.tensor([full_ids], dtype=torch.long)
     attention_mask = torch.ones_like(input_ids)
     return input_ids, attention_mask, text
 

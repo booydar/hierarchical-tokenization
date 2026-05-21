@@ -41,6 +41,7 @@ class RMTConfig(PretrainedConfig):
                  chunker_compression_ratio=None,
                  chunker_aux_loss_weight=0.01,
                  k2=-1,
+                 query_token_id=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.base_model_name = base_model_name
@@ -57,6 +58,9 @@ class RMTConfig(PretrainedConfig):
         self.chunker_compression_ratio = chunker_compression_ratio
         self.chunker_aux_loss_weight = chunker_aux_loss_weight
         self.k2 = k2
+        # Token id for ``?`` — used to locate the KV query (``?!key:``) and
+        # force it into its own segment. Set from the task tokenizer.
+        self.query_token_id = query_token_id
 
     def get(self, attr: str, default=None):
         if hasattr(self, attr):
@@ -177,6 +181,7 @@ class RMTForReasoningDynamicChunking(PreTrainedModel):
             chunker_aux_loss_weight=getattr(config, 'chunker_aux_loss_weight', 0.01),
             max_n_segments=config.max_n_segments,
             k2=getattr(config, 'k2', -1),
+            query_token_id=getattr(config, 'query_token_id', None),
         )
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, labels_mask=None,
@@ -194,7 +199,9 @@ class RMTForReasoningDynamicChunking(PreTrainedModel):
 
     def generate(self, input_ids=None, attention_mask=None, **generate_kwargs):
         return self.rmt.generate(
-            input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **generate_kwargs,
         )
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
@@ -527,6 +534,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
     def __init__(self, memory_cell, d_model=None,
                  chunker_compression_ratio=None,
                  chunker_aux_loss_weight=0.01,
+                 query_token_id=None,
                  **rmt_kwargs):
         """
         Parameters
@@ -576,6 +584,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         self.routing_module = RoutingModule(d_model)
         self.chunker_compression_ratio = chunker_compression_ratio
         self.chunker_aux_loss_weight = chunker_aux_loss_weight
+        self.query_token_id = query_token_id
 
         # Defensive: if the user asks for a target compression ratio but
         # leaves the aux-loss weight at zero, the ratio loss is computed
@@ -583,6 +592,143 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         # backward. Almost always a config mistake — warn loudly.
         if self.chunker_compression_ratio is not None and self.chunker_aux_loss_weight == 0.0:
             warnings.warn("chunker_compression_ratio is set but chunker_aux_loss_weight=0.0 — ratio loss will be computed but not applied.")
+        if self.query_token_id is None:
+            warnings.warn(
+                "query_token_id is not set on RMTConfig — dynamic chunking will not "
+                "isolate the KV query into its own segment."
+            )
+
+    @staticmethod
+    def _infer_query_span(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        query_token_id: int,
+        labels: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Locate the query as the token span starting at the first ``?``.
+
+        ``query_len`` runs from that ``?`` until the first supervised target
+        token (``labels != -100``) when ``labels`` is given, otherwise until
+        the end of the valid (non-pad) region.
+        """
+        batch_size, _ = input_ids.shape
+        device = input_ids.device
+        query_start = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+        query_len = torch.ones((batch_size,), dtype=torch.long, device=device)
+
+        for b in range(batch_size):
+            valid_len = int(attention_mask[b].sum().item())
+            if valid_len == 0:
+                continue
+            row_ids = input_ids[b, :valid_len]
+            qmark_hits = (row_ids == query_token_id).nonzero(as_tuple=True)[0]
+            if len(qmark_hits) == 0:
+                continue
+            qs = int(qmark_hits[0].item())
+            query_start[b] = qs
+
+            if labels is not None:
+                row_labels = labels[b, :valid_len]
+                target_hits = (row_labels != -100).nonzero(as_tuple=True)[0]
+                q_end = int(target_hits[0].item()) if len(target_hits) > 0 else valid_len
+            else:
+                q_end = valid_len
+            query_len[b] = max(q_end - qs, 1)
+
+        return query_start, query_len
+
+    def _apply_query_segment_boundaries(
+        self,
+        boundary_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Auto-detect ``?`` and force the query (and optional target) segments."""
+        if self.query_token_id is None:
+            return boundary_mask, None
+
+        query_start, query_len = self._infer_query_span(
+            input_ids, attention_mask, self.query_token_id, labels=labels,
+        )
+        if (query_start < 0).all():
+            warnings.warn(
+                "No '?' token found in batch — query segment enforcement skipped."
+            )
+            return boundary_mask, None
+
+        boundary_mask = self._enforce_query_segment_boundaries(
+            boundary_mask, attention_mask, query_start, query_len,
+        )
+        return boundary_mask, query_start
+
+    @staticmethod
+    def _enforce_query_segment_boundaries(
+        boundary_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        query_start: torch.Tensor,
+        query_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """Force the query into its own segment; optionally isolate the target too.
+
+        For each batch row ``b``:
+          * ``boundary_mask[b, query_start[b]] = True`` — query begins its own segment.
+          * No boundaries inside ``(query_start, query_start + query_len)`` so the
+            query is never split.
+          * If ``query_start + query_len < valid_len``, a boundary is forced at the
+            first target token so the target can form a following segment (training).
+
+        When the prompt is ``context + query`` only (no target tokens), the query
+        segment is the **last** segment and is the right place to call ``generate``.
+        """
+        boundary_mask = boundary_mask.clone()
+        valid = attention_mask.bool()
+        batch_size, seq_len = boundary_mask.shape
+
+        for b in range(batch_size):
+            qs = int(query_start[b].item())
+            ql = int(query_len[b].item())
+            if qs < 0 or ql <= 0:
+                continue
+            valid_len = int(valid[b].sum().item())
+            if qs >= valid_len:
+                continue
+
+            q_end = min(qs + ql, valid_len)
+            # Strip spurious cuts inside the query span.
+            if q_end > qs + 1:
+                boundary_mask[b, qs + 1:q_end] = False
+            boundary_mask[b, qs] = True
+
+            # Target (if present) starts a new segment after the query.
+            if q_end < valid_len:
+                boundary_mask[b, q_end] = True
+
+        boundary_mask = boundary_mask & valid
+        boundary_mask[:, 0] = True
+        return boundary_mask
+
+    @staticmethod
+    def _resolve_query_segment_index(segmented, query_start: torch.Tensor | None) -> int:
+        """Index of the query-only segment in ``segmented`` (defaults to last)."""
+        if query_start is None or len(segmented) == 0:
+            return len(segmented) - 1
+        batch_size = query_start.shape[0]
+        indices = []
+        for b in range(batch_size):
+            qs = int(query_start[b].item())
+            found = len(segmented) - 1
+            for k, segment in enumerate(segmented):
+                if int(segment['_slice_starts'][b].item()) == qs:
+                    found = k
+                    break
+            indices.append(found)
+        if len(set(indices)) != 1:
+            warnings.warn(
+                "Query segment index differs across batch rows; using the last "
+                f"index ({indices[-1]}). Use batch size 1 for strict decode alignment."
+            )
+        return indices[-1]
 
     def forward(self, input_ids, labels=None, labels_mask=None, inputs_embeds=None,
                 attention_mask=None, output_attentions=None, output_hidden_states=None):
@@ -630,6 +776,14 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         #   routing_out.selected_probs  [B, L, 1]   p of the *chosen* class at each pos
         routing_out = self.routing_module(inputs_embeds, mask=attention_mask.bool())
 
+        boundary_mask, query_start = self._apply_query_segment_boundaries(
+            routing_out.boundary_mask,
+            attention_mask,
+            input_ids,
+            labels=labels,
+        )
+        routing_out.boundary_mask = boundary_mask
+
         # ---------------- step 3: straight-through gate (STE) -------------------------
         # The discrete boundary_mask carries no gradient, so the routing
         # module's weights would never update from the LM loss without help.
@@ -657,7 +811,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         # within that index across the batch. See `segment_by_boundaries` for
         # the exact algorithm.
         segmented = self.segment_by_boundaries(
-            boundary_mask=routing_out.boundary_mask,
+            boundary_mask=boundary_mask,
             attention_mask=attention_mask,
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -705,7 +859,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         main_loss = out.get('loss')
         ratio_loss = self._compute_ratio_loss(
             boundary_prob=routing_out.boundary_prob,
-            boundary_mask=routing_out.boundary_mask,
+            boundary_mask=boundary_mask,
             attention_mask=attention_mask,
         )
         out['lm_loss'] = main_loss
@@ -722,16 +876,16 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         # boundary scores / compute boundary-alignment metrics without
         # re-running the routing module.
         out['boundary_prob'] = routing_out.boundary_prob
-        out['boundary_mask'] = routing_out.boundary_mask
+        out['boundary_mask'] = boundary_mask
         return out
 
     def generate(self, input_ids, attention_mask=None, inputs_embeds=None, **generate_kwargs):
         """Autoregressive generation with dynamic chunking on the context.
 
-        The context (``input_ids``) is segmented exactly as in :meth:`forward`.
-        All but the last segment are used purely to warm up the memory state
-        (forward pass, discard logits). The final segment is then handed to
-        ``memory_cell.generate`` which actually decodes new tokens.
+        Pass ``context + query`` token IDs (no answer/target). The first ``?``
+        (``config.query_token_id``) starts the query segment; earlier segments
+        only warm up memory, then ``memory_cell.generate`` decodes from the
+        query segment.
 
         Shapes
         ------
@@ -751,6 +905,13 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         # Predict boundaries on the context exactly as in forward.
         routing_out = self.routing_module(inputs_embeds, mask=attention_mask.bool())
 
+        boundary_mask, query_start = self._apply_query_segment_boundaries(
+            routing_out.boundary_mask,
+            attention_mask,
+            input_ids,
+            labels=None,
+        )
+
         # STE has forward value 1.0 (mathematical no-op). At pure inference
         # time (``torch.no_grad()``) we skip the multiply because there's no
         # graph to populate. If `generate` is ever called inside a training
@@ -762,7 +923,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
 
         # Same segmentation as forward, except we don't have labels.
         segmented = self.segment_by_boundaries(
-            boundary_mask=routing_out.boundary_mask,
+            boundary_mask=boundary_mask,
             attention_mask=attention_mask,
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -773,10 +934,11 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         if not segmented:
             raise ValueError("Dynamic chunker produced zero segments; nothing to generate from.")
 
-        # Warm-up loop: ingest every segment *except* the last, threading
-        # memory_state. We don't save logits here, only the recurrent state.
+        query_seg_idx = self._resolve_query_segment_index(segmented, query_start)
+
+        # Warm up every segment strictly before the query segment.
         memory_state = None
-        for segment in segmented[:-1]:
+        for segment in segmented[:query_seg_idx]:
             _, memory_state = self.memory_cell(
                 input_ids=segment.get('input_ids'),
                 inputs_embeds=segment.get('inputs_embeds'),
@@ -785,10 +947,8 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
                 output_hidden_states=True,
             )
 
-        # Final segment is the one we let the base model continue from.
-        # MemoryCell.generate prepends the read-memory tokens and calls the
-        # base model's `.generate`.
-        final_segment = segmented[-1]
+        # Decode from the query segment (must be context+query input, no target).
+        final_segment = segmented[query_seg_idx]
         out = self.memory_cell.generate(
             input_ids=final_segment.get('input_ids'),
             inputs_embeds=final_segment.get('inputs_embeds'),

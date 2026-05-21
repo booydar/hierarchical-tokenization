@@ -70,10 +70,8 @@ def collate_fn_dynamic(batch):
         labels          [B, L]   long, -100 on context+query, real IDs on target
         labels_mask     [B, L]   bool, True only on target positions
 
-    The chunker decides segment boundaries at training time. With the -100
-    convention plus ``labels_mask``, per-segment CE in ``process_outputs``
-    correctly ignores all non-target positions regardless of how the chunker
-    happens to split a sequence.
+    The model auto-detects the query at the first ``?`` token (see
+    ``RMTConfig.query_token_id``) and forces it into its own segment.
     """
     def encode(text):
         return tokenizer.encode(text, add_special_tokens=False)
@@ -502,6 +500,7 @@ if __name__ == '__main__':
     rmt_config.eos_token_id = tokenizer.convert_tokens_to_ids('[EOS]')
     rmt_config.chunker_compression_ratio = args.chunker_compression_ratio
     rmt_config.chunker_aux_loss_weight = args.chunker_aux_loss_weight
+    rmt_config.query_token_id = tokenizer.convert_tokens_to_ids('?')
 
     model = RMTForReasoningDynamicChunking(rmt_config)
     # Default main_input_name is 'input_ids', which is what our flat collate

@@ -72,6 +72,9 @@ def build_model_and_tokenizer(ckpt_dir: Path, run_cfg: Dict[str, Any], device: t
     rmt_config.k2 = run_cfg.get("k2", -1)
     rmt_config.chunker_compression_ratio = run_cfg.get("chunker_compression_ratio")
     rmt_config.chunker_aux_loss_weight = run_cfg.get("chunker_aux_loss_weight", 0.01)
+    rmt_config.chunker_ratio_loss_exclude_query_start = run_cfg.get(
+        "chunker_ratio_loss_exclude_query_start", True,
+    )
     rmt_config.query_token_id = tokenizer.convert_tokens_to_ids("?")
 
     model = RMTForReasoningDynamicChunking(rmt_config)

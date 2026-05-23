@@ -437,6 +437,7 @@ class ExperimentArgs:
     # ---- new: dynamic-chunking knobs ----
     chunker_compression_ratio: Optional[float] = field(default=8.0)
     chunker_aux_loss_weight: Optional[float] = field(default=0.01)
+    chunker_ratio_loss_exclude_query_start: Optional[bool] = field(default=True)
     chunker_lr_multiplier: Optional[float] = field(default=2.0)
 
 
@@ -500,6 +501,9 @@ if __name__ == '__main__':
     rmt_config.eos_token_id = tokenizer.convert_tokens_to_ids('[EOS]')
     rmt_config.chunker_compression_ratio = args.chunker_compression_ratio
     rmt_config.chunker_aux_loss_weight = args.chunker_aux_loss_weight
+    rmt_config.chunker_ratio_loss_exclude_query_start = (
+        args.chunker_ratio_loss_exclude_query_start
+    )
     rmt_config.query_token_id = tokenizer.convert_tokens_to_ids('?')
 
     model = RMTForReasoningDynamicChunking(rmt_config)

@@ -139,6 +139,7 @@ If `./data/...` is missing, the script **generates** a dataset on first run usin
 |------|---------|
 | `chunker_compression_ratio` | Target average segment length `N` (tokens). Ratio loss pulls boundary rate toward `1/N`. Example: `4.0` ≈ one boundary every 4 tokens. |
 | `chunker_aux_loss_weight` | λ in `loss = lm_loss + λ * ratio_loss` (default `0.01`). Set `0` to disable ratio loss (not recommended). |
+| `chunker_ratio_loss_exclude_query_start` | If `true` (default), ratio loss ignores the forced query-start boundary at `?` (like position 0). Set `false` to include it in the global `1/N` target. |
 | `chunker_lr_multiplier` | AdamW LR for `routing_module` = `learning_rate × multiplier` (default `2.0`). |
 
 **Training diagnostics**

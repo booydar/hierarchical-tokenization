@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import torch
 from torch.nn import CrossEntropyLoss
@@ -40,6 +42,7 @@ class RMTConfig(PretrainedConfig):
                  # checkpoint and visible to HuggingFace Trainer.
                  chunker_compression_ratio=None,
                  chunker_aux_loss_weight=0.01,
+                 chunker_ratio_loss_exclude_query_start=True,
                  k2=-1,
                  query_token_id=None,
                  **kwargs):
@@ -57,6 +60,9 @@ class RMTConfig(PretrainedConfig):
         self.recurrent_wrapper_cls = "RecurrentWrapperNoSegmentationGenerate"
         self.chunker_compression_ratio = chunker_compression_ratio
         self.chunker_aux_loss_weight = chunker_aux_loss_weight
+        # When True, ratio-loss F/G averages exclude the forced query-start
+        # boundary (like position 0) so compression is regularized in context only.
+        self.chunker_ratio_loss_exclude_query_start = chunker_ratio_loss_exclude_query_start
         self.k2 = k2
         # Token id for ``?`` — used to locate the KV query (``?!key:``) and
         # force it into its own segment. Set from the task tokenizer.
@@ -153,9 +159,10 @@ class RMTForReasoningDynamicChunking(PreTrainedModel):
     expected by HuggingFace ``Trainer`` (``input_ids``, ``attention_mask``,
     ``labels``, ``labels_mask``).
 
-    Reads three extra fields off the config (see ``RMTConfig``):
+    Reads extra chunker fields off the config (see ``RMTConfig``):
         * ``chunker_compression_ratio`` — target ``N`` for the H-Net ratio loss.
         * ``chunker_aux_loss_weight``   — λ in ``loss = lm_loss + λ · ratio_loss``.
+        * ``chunker_ratio_loss_exclude_query_start`` — drop forced ``?`` from ratio loss.
         * ``k2``                         — truncated-BPTT window, forwarded to
           ``manage_gradients``.
     """
@@ -182,6 +189,9 @@ class RMTForReasoningDynamicChunking(PreTrainedModel):
             max_n_segments=config.max_n_segments,
             k2=getattr(config, 'k2', -1),
             query_token_id=getattr(config, 'query_token_id', None),
+            chunker_ratio_loss_exclude_query_start=getattr(
+                config, 'chunker_ratio_loss_exclude_query_start', True,
+            ),
         )
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, labels_mask=None,
@@ -534,6 +544,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
     def __init__(self, memory_cell, d_model=None,
                  chunker_compression_ratio=None,
                  chunker_aux_loss_weight=0.01,
+                 chunker_ratio_loss_exclude_query_start=True,
                  query_token_id=None,
                  **rmt_kwargs):
         """
@@ -557,6 +568,10 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
             ``loss = lm_loss + λ * ratio_loss``. Set to 0 to turn the ratio
             loss off entirely. Default 0.01 follows the H-Net paper range
             scaled down for a small (~135M) backbone.
+        chunker_ratio_loss_exclude_query_start : bool
+            If True (default), positions of the forced query-start boundary
+            (first ``?``) are removed from the ratio-loss ``valid`` mask, like
+            position 0. Set False to count ``qs`` toward the global 1/N target.
         **rmt_kwargs
             Forwarded to :class:`RecurrentWrapper.__init__` and stored in
             ``self.rmt_config``. Notable keys we read elsewhere:
@@ -584,6 +599,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         self.routing_module = RoutingModule(d_model)
         self.chunker_compression_ratio = chunker_compression_ratio
         self.chunker_aux_loss_weight = chunker_aux_loss_weight
+        self.chunker_ratio_loss_exclude_query_start = chunker_ratio_loss_exclude_query_start
         self.query_token_id = query_token_id
 
         # Defensive: if the user asks for a target compression ratio but
@@ -751,14 +767,11 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
             boundary_mask   [B, L]      bool, True at segment starts
         """
         # ---------------- step 1: ensure we have embeddings and a mask ----------------
-        # If the caller gave us token IDs, look up the base model's word
-        # embeddings. Shape after this: [B, L, D].
+        # [B, L, D].
         if inputs_embeds is None:
             inputs_embeds = self.memory_cell.model.get_input_embeddings()(input_ids)
 
         # If no attention mask was provided assume every position is real.
-        # We need this both for routing (so the chunker ignores padding) and
-        # later when we mask out per-segment padding in the loss.
         if attention_mask is None:
             attention_mask = torch.ones(
                 inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device,
@@ -820,8 +833,6 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         )
 
         # ---------------- step 5: recurrent RMT forward over segments -----------------
-        # This is the same loop as in RecurrentWrapper, just over learned
-        # segments instead of fixed-size windows.
         memory_state = None                       # [B, num_mem_tokens, D] after first call
         cell_outputs = []                         # one entry per segment
         for seg_num, segment in enumerate(segmented):
@@ -854,27 +865,21 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
             output_hidden_states=output_hidden_states,
         )
 
-        # Pull the LM loss aside (so we can expose it separately for logging)
-        # and compute the auxiliary ratio loss before combining them.
         main_loss = out.get('loss')
         ratio_loss = self._compute_ratio_loss(
             boundary_prob=routing_out.boundary_prob,
             boundary_mask=boundary_mask,
             attention_mask=attention_mask,
+            query_start=query_start,
         )
         out['lm_loss'] = main_loss
         out['ratio_loss'] = ratio_loss
 
-        # Combine only when both pieces exist and the user asked for a
-        # non-zero weight. Skipping the addition when main_loss is the int 0
-        # (no labels provided) keeps the output type consistent.
+
         if ratio_loss is not None and self.chunker_aux_loss_weight > 0 \
                 and isinstance(main_loss, torch.Tensor):
             out['loss'] = main_loss + self.chunker_aux_loss_weight * ratio_loss
 
-        # Expose raw routing-module outputs so downstream code can plot
-        # boundary scores / compute boundary-alignment metrics without
-        # re-running the routing module.
         out['boundary_prob'] = routing_out.boundary_prob
         out['boundary_mask'] = boundary_mask
         return out
@@ -971,8 +976,6 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
 
         Concrete example (B=2, L=8)
         ---------------------------
-        Imagine::
-
             attention_mask  = [[1,1,1,1,1,1,1,1],     # 8 real tokens
                                [1,1,1,1,1,1,0,0]]     # 6 real, 2 padding
             boundary_mask   = [[T,F,F,T,F,T,F,F],     # boundaries at 0,3,5
@@ -1032,8 +1035,8 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
             # Indices of every True in boundary_mask[b]. Always includes 0
             # thanks to RoutingModule's forced first boundary.
             positions = boundary_mask[b].nonzero(as_tuple=True)[0].tolist()
-            # Number of non-padding tokens for this batch element. Used as
-            # the implicit end of the last segment.
+            # number of non-padding tokens for this batch element 
+            # == implicit end of the last segment.
             valid_len = int(valid_mask[b].sum().item())
             ranges = []
             for i, start in enumerate(positions):
@@ -1051,8 +1054,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         if cap is not None and cap > 0:
             max_n_segments = min(max_n_segments, cap)
 
-        # An entirely empty batch (e.g. all attention_mask zeros) produces no
-        # segments at all — bail out with an empty list, the caller decides.
+
         if max_n_segments == 0:
             return []
 
@@ -1282,7 +1284,13 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
 
         return out
 
-    def _compute_ratio_loss(self, boundary_prob, boundary_mask, attention_mask):
+    def _compute_ratio_loss(
+        self,
+        boundary_prob,
+        boundary_mask,
+        attention_mask,
+        query_start: torch.Tensor | None = None,
+    ):
         """H-Net auxiliary ratio loss (Algorithm 1).
 
         Goal
@@ -1315,20 +1323,21 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         Because F follows G through the argmax (more p ⇒ more positions
         crossing the 0.5 threshold), the system converges to F = G = 1/N.
 
-        Why we exclude position 0
-        -------------------------
-        ``RoutingModule.forward`` hard-codes ``boundary_prob[:, 0] = 1.0``
-        (the ``PAD_PROB`` constant) so every sequence has at least one
-        boundary. That forced-on position is *not* something the chunker
-        learns; including it would bias both F and G upward by
-        ``1 / L_valid``, which on short sequences (~80 tokens for ListOps)
-        is a meaningful fraction of the target rate ``1 / N``.
+        Excluded positions (not in ``valid``)
+        -------------------------------------
+        * Position 0 — ``RoutingModule`` forces a segment start there.
+        * Query start ``qs`` (optional) — enforced by
+          ``_enforce_query_segment_boundaries`` when
+          ``chunker_ratio_loss_exclude_query_start`` is True.
 
         Parameters
         ----------
         boundary_prob   : [B, L, 2] — (p(no_boundary), p(boundary)) per pos.
         boundary_mask   : [B, L]    — hard argmax over boundary_prob.
         attention_mask  : [B, L]    — 1 for real tokens, 0 for padding.
+        query_start     : [B] long, optional — per-row index of first ``?``;
+            from :meth:`_infer_query_span`. Rows with ``query_start[b] < 0``
+            are skipped.
 
         Returns
         -------
@@ -1340,9 +1349,19 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
             return None
 
         # valid[b, i] = 1.0 for learnable, non-padding positions; 0.0 for
-        # padding and for the forced first boundary at position 0.
+        # padding and for structural boundaries excluded below.
         valid = attention_mask.bool().float()                                   # [B, L]
         valid[:, 0] = 0.0
+        if (
+            self.chunker_ratio_loss_exclude_query_start
+            and query_start is not None
+        ):
+            batch_size, seq_len = valid.shape
+            has_query = query_start >= 0
+            if has_query.any():
+                rows = torch.arange(batch_size, device=valid.device)[has_query]
+                cols = query_start[has_query].clamp(max=seq_len - 1)
+                valid[rows, cols] = 0.0
         # Clamp to 1 to avoid div-by-zero on degenerate batches where every
         # position is masked out.
         denom = valid.sum(dim=-1).clamp(min=1.0)                                # [B]

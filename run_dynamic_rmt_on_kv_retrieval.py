@@ -71,7 +71,10 @@ def collate_fn_dynamic(batch):
         labels_mask     [B, L]   bool, True only on target positions
 
     The model auto-detects the query at the first ``?`` token (see
-    ``RMTConfig.query_token_id``) and forces it into its own segment.
+    ``RMTConfig.query_token_id``) and starts the final segment there.
+    By default (``split_query_target_segments=False``) query and target
+    share that segment, matching fixed-segment RMT; set the flag to True
+    for separate query/target RMT steps.
     """
     def encode(text):
         return tokenizer.encode(text, add_special_tokens=False)
@@ -438,6 +441,7 @@ class ExperimentArgs:
     chunker_compression_ratio: Optional[float] = field(default=8.0)
     chunker_aux_loss_weight: Optional[float] = field(default=0.01)
     chunker_ratio_loss_exclude_query_start: Optional[bool] = field(default=True)
+    split_query_target_segments: Optional[bool] = field(default=False)
     chunker_lr_multiplier: Optional[float] = field(default=2.0)
 
 
@@ -504,6 +508,7 @@ if __name__ == '__main__':
     rmt_config.chunker_ratio_loss_exclude_query_start = (
         args.chunker_ratio_loss_exclude_query_start
     )
+    rmt_config.split_query_target_segments = args.split_query_target_segments
     rmt_config.query_token_id = tokenizer.convert_tokens_to_ids('?')
 
     model = RMTForReasoningDynamicChunking(rmt_config)

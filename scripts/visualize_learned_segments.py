@@ -75,6 +75,9 @@ def build_model_and_tokenizer(ckpt_dir: Path, run_cfg: Dict[str, Any], device: t
     rmt_config.chunker_ratio_loss_exclude_query_start = run_cfg.get(
         "chunker_ratio_loss_exclude_query_start", True,
     )
+    rmt_config.split_query_target_segments = run_cfg.get(
+        "split_query_target_segments", False,
+    )
     rmt_config.query_token_id = tokenizer.convert_tokens_to_ids("?")
 
     model = RMTForReasoningDynamicChunking(rmt_config)

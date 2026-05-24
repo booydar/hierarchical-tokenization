@@ -131,7 +131,7 @@ accelerate launch \
 
 If `./data/...` is missing, the script **generates** a dataset on first run using `kv_dataset_utils.generate_sequence` (controlled by `--n_pairs`, `--n_keys`, `--n_values`).
 
-**Query segment.** The model finds the first ``?`` token (`RMTConfig.query_token_id`, set from the KV tokenizer in the training script) and forces the query (`?!key:` …) into one segment; the target (if present) starts the next segment. No manual span metadata in the batch. For inference, call `model.generate` on **`context + query` only** (no target tokens).
+**Query / QT segment.** The model finds the first ``?`` token (`RMTConfig.query_token_id`) and starts the final segment there. Default `split_query_target_segments=False` keeps **query + target in one segment** (same as fixed-segment RMT); only context boundaries are learned. Set `split_query_target_segments=True` for a separate target segment. For inference, call `model.generate` on **`context + query` only**.
 
 **Chunker-specific flags**
 
@@ -140,6 +140,7 @@ If `./data/...` is missing, the script **generates** a dataset on first run usin
 | `chunker_compression_ratio` | Target average segment length `N` (tokens). Ratio loss pulls boundary rate toward `1/N`. Example: `4.0` ≈ one boundary every 4 tokens. |
 | `chunker_aux_loss_weight` | λ in `loss = lm_loss + λ * ratio_loss` (default `0.01`). Set `0` to disable ratio loss (not recommended). |
 | `chunker_ratio_loss_exclude_query_start` | If `true` (default), ratio loss ignores the forced query-start boundary at `?` (like position 0). Set `false` to include it in the global `1/N` target. |
+| `split_query_target_segments` | If `false` (default), one final RMT segment for query+target (original RMT parity). If `true`, target is a separate segment. |
 | `chunker_lr_multiplier` | AdamW LR for `routing_module` = `learning_rate × multiplier` (default `2.0`). |
 
 **Training diagnostics**

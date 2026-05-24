@@ -43,6 +43,7 @@ class RMTConfig(PretrainedConfig):
                  chunker_compression_ratio=None,
                  chunker_aux_loss_weight=0.01,
                  chunker_ratio_loss_exclude_query_start=True,
+                 split_query_target_segments=False,
                  k2=-1,
                  query_token_id=None,
                  **kwargs):
@@ -63,6 +64,9 @@ class RMTConfig(PretrainedConfig):
         # When True, ratio-loss F/G averages exclude the forced query-start
         # boundary (like position 0) so compression is regularized in context only.
         self.chunker_ratio_loss_exclude_query_start = chunker_ratio_loss_exclude_query_start
+        # False (default): one final segment query+target, like fixed-segment RMT.
+        # True: separate RMT steps for query and target (older dynamic behaviour).
+        self.split_query_target_segments = split_query_target_segments
         self.k2 = k2
         # Token id for ``?`` — used to locate the KV query (``?!key:``) and
         # force it into its own segment. Set from the task tokenizer.
@@ -163,6 +167,8 @@ class RMTForReasoningDynamicChunking(PreTrainedModel):
         * ``chunker_compression_ratio`` — target ``N`` for the H-Net ratio loss.
         * ``chunker_aux_loss_weight``   — λ in ``loss = lm_loss + λ · ratio_loss``.
         * ``chunker_ratio_loss_exclude_query_start`` — drop forced ``?`` from ratio loss.
+        * ``split_query_target_segments`` — if False, query+target share one segment
+          (original RMT parity); if True, target is a separate segment.
         * ``k2``                         — truncated-BPTT window, forwarded to
           ``manage_gradients``.
     """
@@ -191,6 +197,9 @@ class RMTForReasoningDynamicChunking(PreTrainedModel):
             query_token_id=getattr(config, 'query_token_id', None),
             chunker_ratio_loss_exclude_query_start=getattr(
                 config, 'chunker_ratio_loss_exclude_query_start', True,
+            ),
+            split_query_target_segments=getattr(
+                config, 'split_query_target_segments', False,
             ),
         )
 
@@ -545,6 +554,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
                  chunker_compression_ratio=None,
                  chunker_aux_loss_weight=0.01,
                  chunker_ratio_loss_exclude_query_start=True,
+                 split_query_target_segments=False,
                  query_token_id=None,
                  **rmt_kwargs):
         """
@@ -572,6 +582,9 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
             If True (default), positions of the forced query-start boundary
             (first ``?``) are removed from the ratio-loss ``valid`` mask, like
             position 0. Set False to count ``qs`` toward the global 1/N target.
+        split_query_target_segments : bool
+            If False (default), match fixed-segment RMT: one final segment for
+            query+target. If True, force a boundary before the target tokens.
         **rmt_kwargs
             Forwarded to :class:`RecurrentWrapper.__init__` and stored in
             ``self.rmt_config``. Notable keys we read elsewhere:
@@ -600,6 +613,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         self.chunker_compression_ratio = chunker_compression_ratio
         self.chunker_aux_loss_weight = chunker_aux_loss_weight
         self.chunker_ratio_loss_exclude_query_start = chunker_ratio_loss_exclude_query_start
+        self.split_query_target_segments = split_query_target_segments
         self.query_token_id = query_token_id
 
         # Defensive: if the user asks for a target compression ratio but
@@ -660,7 +674,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Auto-detect ``?`` and force the query (and optional target) segments."""
+        """Auto-detect ``?`` and pin segment boundaries for the query / QT tail."""
         if self.query_token_id is None:
             return boundary_mask, None
 
@@ -674,7 +688,11 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
             return boundary_mask, None
 
         boundary_mask = self._enforce_query_segment_boundaries(
-            boundary_mask, attention_mask, query_start, query_len,
+            boundary_mask,
+            attention_mask,
+            query_start,
+            query_len,
+            split_query_target_segments=self.split_query_target_segments,
         )
         return boundary_mask, query_start
 
@@ -684,18 +702,16 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         attention_mask: torch.Tensor,
         query_start: torch.Tensor,
         query_len: torch.Tensor,
+        split_query_target_segments: bool = False,
     ) -> torch.Tensor:
-        """Force the query into its own segment; optionally isolate the target too.
+        """Pin boundaries at the query so context and QT do not merge.
 
-        For each batch row ``b``:
-          * ``boundary_mask[b, query_start[b]] = True`` — query begins its own segment.
-          * No boundaries inside ``(query_start, query_start + query_len)`` so the
-            query is never split.
-          * If ``query_start + query_len < valid_len``, a boundary is forced at the
-            first target token so the target can form a following segment (training).
+        Default (``split_query_target_segments=False``) matches fixed-segment RMT:
+        one final segment ``[query | target]`` with no internal boundaries.
 
-        When the prompt is ``context + query`` only (no target tokens), the query
-        segment is the **last** segment and is the right place to call ``generate``.
+        When ``split_query_target_segments=True`` (legacy dynamic behaviour):
+          * query occupies its own segment;
+          * target (if present) starts a new segment after the query.
         """
         boundary_mask = boundary_mask.clone()
         valid = attention_mask.bool()
@@ -711,14 +727,16 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
                 continue
 
             q_end = min(qs + ql, valid_len)
-            # Strip spurious cuts inside the query span.
-            if q_end > qs + 1:
-                boundary_mask[b, qs + 1:q_end] = False
             boundary_mask[b, qs] = True
 
-            # Target (if present) starts a new segment after the query.
-            if q_end < valid_len:
-                boundary_mask[b, q_end] = True
+            if split_query_target_segments:
+                if q_end > qs + 1:
+                    boundary_mask[b, qs + 1:q_end] = False
+                if q_end < valid_len:
+                    boundary_mask[b, q_end] = True
+            elif qs + 1 < valid_len:
+                # Single QT segment: no learned cuts through query or target.
+                boundary_mask[b, qs + 1:valid_len] = False
 
         boundary_mask = boundary_mask & valid
         boundary_mask[:, 0] = True
@@ -726,7 +744,7 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
 
     @staticmethod
     def _resolve_query_segment_index(segmented, query_start: torch.Tensor | None) -> int:
-        """Index of the query-only segment in ``segmented`` (defaults to last)."""
+        """Index of the segment starting at ``?`` (query-only or query+target)."""
         if query_start is None or len(segmented) == 0:
             return len(segmented) - 1
         batch_size = query_start.shape[0]
@@ -888,9 +906,9 @@ class RecurrentWrapperDynamicChunking(RecurrentWrapper):
         """Autoregressive generation with dynamic chunking on the context.
 
         Pass ``context + query`` token IDs (no answer/target). The first ``?``
-        (``config.query_token_id``) starts the query segment; earlier segments
-        only warm up memory, then ``memory_cell.generate`` decodes from the
-        query segment.
+        (``config.query_token_id``) starts the final segment (query alone, or
+        query+target when training-style labels are present); earlier segments
+        only warm up memory, then ``memory_cell.generate`` decodes from there.
 
         Shapes
         ------
